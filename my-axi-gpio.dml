@@ -175,16 +175,10 @@ bank regs {
 	}
 
 	method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
-	    if(GPIO_interrupt_posted == true) {
-		log info, 2: "GPIO_interrupt_posted was true";
-	    }
 	    if(ipisr.CH1.val == 1) {
 		ipisr.CH1.val = 0;
 		GPIO_interrupt_posted = false;
 		intr_target.signal.signal_lower();
-	    }
-	    if(GPIO_interrupt_posted == false) {
-		log info, 2: "GPIO_interrupt_posted is false";
 	    }
 	    return  default(enabled_bytes, aux);
 	}
