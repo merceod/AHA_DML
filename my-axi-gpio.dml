@@ -1,0 +1,215 @@
+// my-axi-gpio.dml - DML implementation of AXI GPIO
+
+dml 1.4;
+
+device my_axi_gpio;
+
+param desc = "AXI GPIO";
+
+param documentation =
+    "Implementation of the AXI GPIO which can be configured as a "
+    + "single or a dual channel device. The ports are configured "
+    + "dynamically for input or output by enabling or disabling "
+    + "the 3-state buffer. The channels can be configured to generate "
+    + "an interrupt when a transition on any of their input occurs.";
+
+import "utility.dml";
+import "simics/devs/memory-space.dml";
+
+// Memory-space connection for DMA work
+connect target_mem_space {
+    param documentation =
+        "The memory space on which the DMA engine operates. Data will be "
+        + "read from and copied to the memory associated with this memory "
+        + "space.";
+    param configuration = "required";
+    interface memory_space;
+}
+
+// Tracks if interrupts are posted
+saved bool GPIO_interrupt_posted;
+saved bool GPIO2_interrupt_posted;
+
+// CPU connection for interrupting (for GPIO channel 1)
+connect intr_target{
+    param documentation =
+	"Interrupt target port to signal on GPIO channel 1 interrupts.";
+    param configuration = "required";
+    interface signal;
+}
+
+// CPU connection for interrupting (for GPIO channel 2)
+connect intr_target2{
+    param documentation =
+	"Interrupt target port to signal on GPIO channel 2 interrupts.";
+    param configuration = "required";
+    interface signal;
+}
+
+
+// Basic bank declaration
+bank regs {
+    param register_size = 4;
+    register gpio_data @ 0x00 "Channel 1 AXI GPIO Data Register.";
+    register gpio_tri @ 0x04 "Channel 1 AXI GPIO 3-state Control Register.";
+    register gpio2_data @ 0x08 "Channel 2 AXI GPIO Data Register.";
+    register gpio2_tri @ 0x0C "Channel 2 AXI GPIO 3-state Control Register.";
+    register gier @ 0x011C "Global Interrupt Enable Register.";
+    register ipier @ 0x0128 "IP Interrupt Enable Register.";
+    register ipisr @ 0x0120 "IP Interrupt Status Register.";
+}
+
+bank regs {
+    register gier {
+	field GIE @ [31] "Global Interrupt Enable";
+	field NA @ [30:0] "Reserved";
+
+	method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+	    local uint32 mask = 1 << 31;
+	    local uint32 masked_val = value & mask;
+	    if ((masked_val >> 31) == 1) {
+		gier.GIE.val = 1;
+	    } else {
+		gier.GIE.val = 0;
+
+		// If user sets GIER to 0 then we should automatically disable
+		// interrupts i.e. turn IPIER channels (both) to zero ???
+		// ipier.CH1.val = 0;
+		// ipier.CH2.val = 0;
+		// ipier.NA.val = 0;
+	    }
+	    gier.NA.val = 0;
+	}
+	
+    }
+
+    register ipier {
+	field NA @ [31:2] "Reserved";
+	field CH2 @ [1] "Channel 2 Interrupt Enable";
+	field CH1 @ [0] "Channel 1 Interrupt Enable";
+
+	method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+	    //if (gier.GIE.val != 1) {
+		// only allowing IPIER bits to be set if GIER bit 31 is set??????
+		//return;
+	    // }
+	    local uint32 val_to_write = (value << 30);
+	    val_to_write = val_to_write >> 30;
+	    if (val_to_write == 1) {
+		ipier.CH1.val = 1;
+		ipier.CH2.val = 0;
+	    } else if (val_to_write == 2) {
+		ipier.CH1.val = 0;
+		ipier.CH2.val = 1;
+	    } else  if (val_to_write == 3) {
+		ipier.CH1.val = 1;
+		ipier.CH2.val = 1;
+	    } else  if (val_to_write == 0) {
+		ipier.CH1.val = 0;
+		ipier.CH2.val = 0;
+	    }
+	    ipier.NA.val = 0;
+	}
+    }
+    
+    register ipisr {
+	field NA @ [31:2] "Reserved";
+	field CH2 @ [1] "Channel 2 Interrupt Status";
+	field CH1 @ [0] "Channel 1 Interrupt Status";
+
+	// The IPISR register is ToW which means that the value of bits 0 and 1
+	// corresponding to channels 1 and 2 respectively can be changed by
+	// writing a 1 in those positions. 
+	method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+	    local uint32 val_to_write = (value << 30);
+	    val_to_write = val_to_write >> 30;
+	    if (val_to_write == 1) {
+		if(ipisr.CH1.val == 1) {
+		    ipisr.CH1.val = 0;
+		} else {
+		    ipisr.CH1.val = 1;
+		    GPIO_interrupt_posted = true;
+		    intr_target.signal.signal_raise();
+		}
+	    } else if (val_to_write == 2) {
+		if(ipisr.CH2.val == 1) {
+		    ipisr.CH2.val = 0;
+		} else {
+		    ipisr.CH2.val = 1;
+		    GPIO2_interrupt_posted = true;
+		    intr_target2.signal.signal_raise();
+		}
+	    } else  if (val_to_write == 3) {
+		if(ipisr.CH1.val == 1) {
+		    ipisr.CH1.val = 0;
+		} else {
+		    ipisr.CH1.val = 1;
+		    GPIO_interrupt_posted = true;
+		    intr_target.signal.signal_raise();
+		}
+		
+		if(ipisr.CH2.val == 1) {
+		    ipisr.CH2.val = 0;
+		} else {
+		    ipisr.CH2.val = 1;
+		    GPIO2_interrupt_posted = true;
+		    intr_target2.signal.signal_raise();
+		}
+	    } 
+	    ipisr.NA.val = 0;
+	}
+    }
+    
+}
+
+bank regs {
+    register gpio_data {
+
+	// When a port/pin is configured as input (i.e. the corresponding
+	// gpio_tri bit is 1, writing to the AXI GPIO Data Register has no
+	// effect (for that specific port/pin)
+	method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+	    local uint32 tri_reg = gpio_tri.val;
+	    tri_reg = ~tri_reg;
+	    gpio_data.val = tri_reg & value;
+	}
+
+	method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
+	    if(GPIO_interrupt_posted == true) {
+		log info, 2: "GPIO_interrupt_posted was true";
+	    }
+	    if(ipisr.CH1.val == 1) {
+		ipisr.CH1.val = 0;
+		GPIO_interrupt_posted = false;
+		intr_target.signal.signal_lower();
+	    }
+	    if(GPIO_interrupt_posted == false) {
+		log info, 2: "GPIO_interrupt_posted is false";
+	    }
+	    return  default(enabled_bytes, aux);
+	}
+	    
+    }
+
+    register gpio2_data {
+
+	// When a port/pin is configured as input (i.e. the corresponding
+	// gpio2_tri bit is 1, writing to the AXI GPIO Data Register has no
+	// effect (for that specific port/pin)
+	method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+	    local uint32 tri_reg = gpio2_tri.val;
+	    tri_reg = ~tri_reg;
+	    gpio2_data.val = tri_reg & value;
+	}
+
+        method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
+	    if(ipisr.CH2.val == 1) {
+		ipisr.CH2.val = 0;
+		GPIO2_interrupt_posted = false;
+		intr_target2.signal.signal_lower();
+	    }
+	    return default(enabled_bytes, aux);
+	}
+    }
+}
+	
